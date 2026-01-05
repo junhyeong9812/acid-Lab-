@@ -11,6 +11,7 @@
 - CSV 파일 기반 영속성 구현 (`data/` 폴더)
 - Write-Ahead Log (WAL) 직접 구현
 - 각 ACID 속성별 시나리오 테스트
+- **도메인 기반 + 헥사고날 아키텍처** 적용
 
 ### 주요 특징
 - ✅ ACID 4가지 속성 각각을 시나리오로 검증
@@ -18,6 +19,7 @@
 - ✅ Write-Ahead Log (WAL) 직접 구현
 - ✅ 행 단위 락 (Row-Level Lock) 구현
 - ✅ 트랜잭션 롤백/커밋 메커니즘
+- ✅ 포트/어댑터 패턴으로 도메인 간 의존성 분리
 - ✅ 실시간 메트릭 수집 및 리포트 생성
 
 ---
@@ -47,6 +49,8 @@
 
 ## 🏛️ 아키텍처
 
+### 전체 구조
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         ACID Lab                                │
@@ -60,30 +64,66 @@
 │                             │                                   │
 │                             ▼                                   │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │                  Transaction Manager                     │   │
-│  │         begin() │ commit() │ rollback()                 │   │
-│  └──────────────────────────┬──────────────────────────────┘   │
-│                             │                                   │
-│              ┌──────────────┼──────────────┐                   │
-│              ▼              ▼              ▼                   │
-│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐        │
-│  │  LockManager  │ │  Validator    │ │ WriteAheadLog │        │
-│  │  (Isolation)  │ │ (Consistency) │ │ (Durability)  │        │
-│  └───────┬───────┘ └───────────────┘ └───────┬───────┘        │
-│          │                                    │                 │
-│          ▼                                    ▼                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              InMemory Repository                         │   │
-│  │         (with snapshot for Atomicity)                    │   │
+│  │              Transaction Domain (Application)            │   │
+│  │                   TransactionService                     │   │
+│  │                         │                                │   │
+│  │                         ▼                                │   │
+│  │                   AccountPort ◄─────────────────────┐   │   │
+│  │                    (interface)                       │   │   │
+│  └──────────────────────────┬──────────────────────────│───┘   │
+│                             │                          │        │
+│              ┌──────────────┼──────────────┐          │        │
+│              ▼              ▼              ▼          │        │
+│  ┌───────────────┐ ┌───────────────┐ ┌────────────┐  │        │
+│  │  LockManager  │ │  Validator    │ │   WAL      │  │        │
+│  │  (Isolation)  │ │ (Consistency) │ │(Durability)│  │        │
+│  └───────────────┘ └───────────────┘ └────────────┘  │        │
+│                                                       │        │
+│  ┌────────────────────────────────────────────────────┼────┐   │
+│  │           Transaction Infrastructure               │    │   │
+│  │                  AccountAdapter ───────────────────┘    │   │
+│  │                   (implements AccountPort)              │   │
 │  └──────────────────────────┬──────────────────────────────┘   │
 │                             │                                   │
 │                             ▼                                   │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    CSV Storage                           │   │
-│  │     accounts.csv │ transactions.csv │ wal.csv           │   │
+│  │                 Account Domain                           │   │
+│  │     AccountService → AccountRepository → CSV Storage    │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+### 도메인 간 의존성 (포트/어댑터 패턴)
+
+```
+┌─────────────────────┐         ┌─────────────────────┐
+│  transaction        │         │  account            │
+│  ┌───────────────┐  │         │  ┌───────────────┐  │
+│  │ application/  │  │         │  │ application/  │  │
+│  │ Transaction   │  │         │  │ AccountService│  │
+│  │ Service       │  │         │  └───────┬───────┘  │
+│  └───────┬───────┘  │         │          │          │
+│          │          │         │          ▼          │
+│          ▼          │         │  ┌───────────────┐  │
+│  ┌───────────────┐  │         │  │ repository/   │  │
+│  │ port/         │  │         │  │ AccountRepo   │  │
+│  │ AccountPort   │◄─┼─────────┼──│               │  │
+│  │ (interface)   │  │         │  └───────────────┘  │
+│  └───────────────┘  │         │                     │
+│          ▲          │         └─────────────────────┘
+│          │          │
+│  ┌───────┴───────┐  │
+│  │infrastructure/│  │
+│  │ adapter/      │  │
+│  │ AccountAdapter│  │
+│  └───────────────┘  │
+└─────────────────────┘
+
+의존성 방향:
+- TransactionService → AccountPort (추상화에 의존)
+- AccountAdapter → AccountService (구현체가 연결)
+- Transaction 도메인은 Account 도메인을 직접 모름!
 ```
 
 ---
@@ -93,60 +133,172 @@
 ```
 acid-lab/
 ├── src/main/java/com/experiment/acidlab/
-│   ├── AcidLabApplication.java              # 메인 진입점
+│   ├── AcidLabApplication.java
 │   │
-│   ├── model/
-│   │   ├── Account.java                     # 계좌 엔티티
-│   │   ├── Transaction.java                 # 거래 기록
-│   │   └── WalEntry.java                    # WAL 로그 엔트리
+│   ├── account/                                    # 계좌 도메인
+│   │   ├── domain/
+│   │   │   └── Account.java
+│   │   ├── application/
+│   │   │   └── AccountService.java
+│   │   ├── repository/
+│   │   │   ├── AccountRepository.java              # 인터페이스
+│   │   │   ├── InMemoryAccountRepository.java
+│   │   │   └── CsvAccountRepository.java
+│   │   └── validation/
+│   │       ├── AccountValidator.java
+│   │       └── BalanceConstraint.java
 │   │
-│   ├── repository/
-│   │   ├── AccountRepository.java           # 인터페이스
-│   │   ├── InMemoryAccountRepository.java   # 인메모리 구현
-│   │   └── CsvAccountRepository.java        # CSV 영속화 구현
+│   ├── transaction/                                # 트랜잭션 도메인
+│   │   ├── domain/
+│   │   │   ├── Transaction.java
+│   │   │   └── TransactionStatus.java
+│   │   ├── application/
+│   │   │   ├── TransactionService.java
+│   │   │   └── port/
+│   │   │       └── AccountPort.java                # 포트 (인터페이스)
+│   │   ├── manager/
+│   │   │   ├── TransactionManager.java
+│   │   │   └── TransactionContext.java
+│   │   ├── infrastructure/
+│   │   │   └── adapter/
+│   │   │       └── AccountAdapter.java             # 어댑터 (구현체)
+│   │   └── repository/
+│   │       ├── TransactionRepository.java
+│   │       └── CsvTransactionRepository.java
 │   │
+│   ├── storage/                                    # 저장소 도메인
+│   │   ├── csv/
+│   │   │   └── CsvStorage.java
+│   │   └── wal/
+│   │       ├── WalEntry.java
+│   │       └── WriteAheadLog.java
+│   │
+│   ├── lock/                                       # 락 도메인
+│   │   ├── domain/
+│   │   │   └── RowLock.java
+│   │   └── manager/
+│   │       └── LockManager.java
+│   │
+│   ├── scenario/                                   # 실험 시나리오
+│   │   ├── AtomicityScenario.java
+│   │   ├── ConsistencyScenario.java
+│   │   ├── IsolationScenario.java
+│   │   └── DurabilityScenario.java
+│   │
+│   ├── benchmark/                                  # 벤치마크
+│   │   └── AcidBenchmark.java
+│   │
+│   └── global/                                     # 공통
+│       ├── config/
+│       │   └── BeanConfig.java
+│       ├── logger/
+│       │   └── ConsoleLogger.java
+│       └── metrics/
+│           └── MetricsCollector.java
+│
+├── src/main/resources/
+│   └── application.yml
+│
+├── src/test/java/com/experiment/acidlab/
+│   ├── account/
 │   ├── transaction/
-│   │   ├── TransactionManager.java          # 트랜잭션 관리자
-│   │   ├── TransactionContext.java          # 트랜잭션 컨텍스트
-│   │   └── TransactionStatus.java           # 상태 enum
-│   │
 │   ├── storage/
-│   │   ├── CsvStorage.java                  # CSV 읽기/쓰기 유틸
-│   │   └── WriteAheadLog.java               # WAL 구현
-│   │
-│   ├── lock/
-│   │   ├── LockManager.java                 # 락 관리자
-│   │   └── RowLock.java                     # 행 단위 락
-│   │
-│   ├── validation/
-│   │   ├── ConstraintValidator.java         # 제약조건 검증기
-│   │   └── BalanceConstraint.java           # 잔액 >= 0 제약
-│   │
-│   ├── scenario/
-│   │   ├── AtomicityScenario.java           # A: 원자성 실험
-│   │   ├── ConsistencyScenario.java         # C: 일관성 실험
-│   │   ├── IsolationScenario.java           # I: 격리성 실험
-│   │   └── DurabilityScenario.java          # D: 영속성 실험
-│   │
-│   ├── benchmark/
-│   │   └── AcidBenchmark.java               # 성능 측정
-│   │
-│   └── common/
-│       ├── ConsoleLogger.java               # 콘솔 로깅
-│       └── MetricsCollector.java            # 메트릭 수집
+│   └── lock/
 │
-├── data/                                     # CSV 데이터 저장소
-│   ├── accounts.csv                         # 계좌 테이블
-│   ├── transactions.csv                     # 거래 기록 테이블
-│   └── wal.csv                              # Write-Ahead Log
+├── data/                                           # CSV 데이터 저장소
+│   ├── accounts.csv
+│   ├── transactions.csv
+│   └── wal.csv
 │
-├── results/                                  # 실험 결과
+├── results/                                        # 실험 결과
 │   ├── reports/
 │   └── logs/
 │
 ├── build.gradle
 ├── settings.gradle
 └── README.md
+```
+
+---
+
+## 🔗 포트/어댑터 패턴 코드 예시
+
+### AccountPort (포트 - 인터페이스)
+
+```java
+// transaction/application/port/AccountPort.java
+public interface AccountPort {
+    void withdraw(Long accountId, long amount);
+    void deposit(Long accountId, long amount);
+    Account findById(Long accountId);
+    boolean exists(Long accountId);
+}
+```
+
+### AccountAdapter (어댑터 - 구현체)
+
+```java
+// transaction/infrastructure/adapter/AccountAdapter.java
+@Component
+@RequiredArgsConstructor
+public class AccountAdapter implements AccountPort {
+    
+    private final AccountService accountService;
+    
+    @Override
+    public void withdraw(Long accountId, long amount) {
+        accountService.withdraw(accountId, amount);
+    }
+    
+    @Override
+    public void deposit(Long accountId, long amount) {
+        accountService.deposit(accountId, amount);
+    }
+    
+    @Override
+    public Account findById(Long accountId) {
+        return accountService.findById(accountId);
+    }
+    
+    @Override
+    public boolean exists(Long accountId) {
+        return accountService.exists(accountId);
+    }
+}
+```
+
+### TransactionService (포트 사용)
+
+```java
+// transaction/application/TransactionService.java
+@Service
+@RequiredArgsConstructor
+public class TransactionService {
+    
+    private final AccountPort accountPort;          // 인터페이스에만 의존!
+    private final TransactionManager transactionManager;
+    private final TransactionRepository transactionRepository;
+    
+    public void transfer(Long fromId, Long toId, long amount) {
+        Transaction tx = Transaction.create(fromId, toId, amount);
+        
+        transactionManager.begin();
+        try {
+            accountPort.withdraw(fromId, amount);
+            accountPort.deposit(toId, amount);
+            
+            tx.commit();
+            transactionRepository.save(tx);
+            transactionManager.commit();
+            
+        } catch (Exception e) {
+            tx.rollback();
+            transactionRepository.save(tx);
+            transactionManager.rollback();
+            throw e;
+        }
+    }
+}
 ```
 
 ---
@@ -162,7 +314,7 @@ acid-lab/
 1. A 잔액: 50,000원, B 잔액: 30,000원
 2. A에서 10,000원 출금 (A: 40,000원)
 3. ⚡ 예외 발생! (네트워크 오류 시뮬레이션)
-    4. B에 입금 실패
+4. B에 입금 실패
 
 // 검증
 ❌ Atomicity 미적용: A=40,000원, B=30,000원 (10,000원 증발!)
@@ -187,12 +339,12 @@ acid-lab/
 3. 제약조건 검사: balance >= 0
 
 // 검증
-    ❌ Consistency 미적용: A=-40,000원 (음수 잔액!)
+❌ Consistency 미적용: A=-40,000원 (음수 잔액!)
 ✅ Consistency 적용: 트랜잭션 거부, A=10,000원 유지
 ```
 
 **구현 포인트**:
-- 커밋 전 제약조건 검증
+- 커밋 전 제약조건 검증 (AccountValidator)
 - 전체 잔액 합계 보존 검증
 - 위반 시 트랜잭션 거부
 
@@ -219,7 +371,7 @@ Thread 2: write(A, 50,000)  // 덮어쓰기!
 ```
 
 **구현 포인트**:
-- 행 단위 락 (Row-Level Lock)
+- 행 단위 락 (LockManager, RowLock)
 - 락 획득 순서 관리
 - 타임아웃 설정
 
@@ -295,8 +447,9 @@ lsn,transaction_id,operation,table_name,row_id,before_value,after_value,timestam
 | 구분 | 기술 |
 |------|------|
 | Language | Java 25 |
-| Framework | Spring Boot 4.0.1 (유틸/테스트용) |
+| Framework | Spring Boot 4.0.1 |
 | Build | Gradle (Groovy) |
+| Architecture | 도메인 기반 + 헥사고날 (포트/어댑터) |
 | Storage | CSV 파일 기반 |
 | Concurrency | ReentrantLock, synchronized |
 
@@ -360,10 +513,10 @@ cd acid-lab
 # 2. 빌드
 ./gradlew clean build
 
-# 2. 전체 시나리오 실행
+# 3. 전체 시나리오 실행
 ./gradlew bootRun
 
-# 3. 개별 시나리오 실행
+# 4. 개별 시나리오 실행
 java -cp build/classes/java/main \
   com.experiment.acidlab.scenario.AtomicityScenario
 
@@ -373,13 +526,66 @@ java -cp build/classes/java/main \
 
 ---
 
+## 🏗️ 아키텍처 선택 이유
+
+### 왜 도메인 최상위 구조인가?
+
+```
+❌ 레이어 최상위 (MVC 스타일)
+src/
+├── controller/
+├── service/
+├── repository/
+└── domain/
+
+→ account 관련 코드가 4개 폴더에 흩어짐
+→ 도메인 파악이 어려움
+
+✅ 도메인 최상위
+src/
+├── account/
+│   ├── domain/
+│   ├── application/
+│   └── repository/
+├── transaction/
+└── ...
+
+→ account 폴더 하나만 보면 됨
+→ MSA 전환 시 폴더 단위 분리 가능
+```
+
+### 왜 포트/어댑터 패턴인가?
+
+```
+❌ 직접 의존
+TransactionService → AccountService (강결합)
+
+✅ 포트/어댑터
+TransactionService → AccountPort (인터페이스)
+AccountAdapter → AccountService (구현체 연결)
+
+→ Transaction 도메인이 Account 도메인을 직접 모름
+→ 테스트 시 Mock 주입 용이
+→ 의존성 역전 원칙 (DIP) 준수
+```
+
+---
+
 ## 💡 핵심 교훈
 
+### ACID
 ```
 1. Atomicity: "All or Nothing" - 중간 상태는 존재하지 않는다
 2. Consistency: 규칙 위반은 절대 허용하지 않는다
 3. Isolation: 동시 실행 = 순차 실행과 같은 결과
 4. Durability: 커밋 = 영원한 약속
+```
+
+### 아키텍처
+```
+1. 도메인 최상위 구조 → 응집도 높은 코드
+2. 포트/어댑터 패턴 → 도메인 간 느슨한 결합
+3. 학습 프로젝트에서 다양한 패턴 경험 → 실무 선택지 확보
 ```
 
 ---
@@ -393,11 +599,15 @@ java -cp build/classes/java/main \
 
 ## 📚 참고 자료
 
+### ACID & Database
 - [Database Internals](https://www.databass.dev/) - Alex Petrov
 - [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann
 - [Write-Ahead Logging](https://en.wikipedia.org/wiki/Write-ahead_logging)
 - [Two-Phase Locking (2PL)](https://en.wikipedia.org/wiki/Two-phase_locking)
 
----
+### Architecture
+- [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)
+- [Clean Architecture](https://blog.cleancoder.com/uncle-bob/2012/08/13/the-clean-architecture.html)
+- [Domain-Driven Design](https://martinfowler.com/bliki/DomainDrivenDesign.html)
 
-**Made with 💡 for deeper understanding of Database ACID properties**
+---
